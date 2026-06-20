@@ -1,0 +1,609 @@
+-- ============================================================
+-- GAG2 Fruit Scanner v4.5
+-- Real fitted formulas for Dragon's Breath (per-mutation power law):
+--   kg     = 7.4826 × SizeMulti
+--   value  = a × kg^b   (in millions)
+-- Other seeds fall back to the squared estimate.
+-- ============================================================
+if game:GetService("CoreGui"):FindFirstChild("GAG_FruitScanner") then
+    game:GetService("CoreGui").GAG_FruitScanner:Destroy()
+end
+
+local Players    = game:GetService("Players")
+local Workspace  = game:GetService("Workspace")
+local CoreGui    = game:GetService("CoreGui")
+local RS         = game:GetService("ReplicatedStorage")
+local lp         = Players.LocalPlayer
+local Networking = require(RS.SharedModules.Networking)
+
+local SVD = {}
+pcall(function() SVD = require(RS.SharedModules.SellValueData) end)
+
+-- ---------- tiers ----------
+local TIERS = {
+    {min=8.0, max=math.huge, name="T9", color=Color3.fromRGB(255,80,255)},
+    {min=6.0, max=8.0,      name="T8", color=Color3.fromRGB(255,40,90)},
+    {min=5.0, max=6.0,      name="T7", color=Color3.fromRGB(255,140,0)},
+    {min=4.0, max=5.0,      name="T6", color=Color3.fromRGB(255,210,0)},
+    {min=3.0, max=4.0,      name="T5", color=Color3.fromRGB(120,220,90)},
+    {min=2.0, max=3.0,      name="T4", color=Color3.fromRGB(80,200,200)},
+    {min=1.5, max=2.0,      name="T3", color=Color3.fromRGB(90,150,255)},
+    {min=1.0, max=1.5,      name="T2", color=Color3.fromRGB(170,170,170)},
+    {min=0.0, max=1.0,      name="T1", color=Color3.fromRGB(120,120,120)},
+}
+local function tierOf(size)
+    for _, t in ipairs(TIERS) do
+        if size >= t.min and size < t.max then return t end
+    end
+    return TIERS[#TIERS]
+end
+
+-- ---------- value ranges ----------
+local RANGES = {
+    {name="1-3M",   min=1_000_000,   max=3_000_000,   color=Color3.fromRGB(120,200,255)},
+    {name="3-5M",   min=3_000_000,   max=5_000_000,   color=Color3.fromRGB(120,220,90)},
+    {name="5-10M",  min=5_000_000,   max=10_000_000,  color=Color3.fromRGB(255,210,0)},
+    {name="10-20M", min=10_000_000,  max=20_000_000,  color=Color3.fromRGB(255,140,0)},
+    {name="20M+",   min=20_000_000,  max=math.huge,   color=Color3.fromRGB(255,80,255)},
+}
+local function inAnySelectedRange(val, selected)
+    for _, r in ipairs(RANGES) do
+        if selected[r.name] and val >= r.min and val < r.max then return true end
+    end
+    return false
+end
+local function anyRangeSelected(selected)
+    for _, r in ipairs(RANGES) do if selected[r.name] then return true end end
+    return false
+end
+
+-- ---------- mutations ----------
+local MUT_COLORS = {
+    Gold=Color3.fromRGB(255,200,40), Rainbow=Color3.fromRGB(255,120,220),
+    Electric=Color3.fromRGB(255,230,80), Frozen=Color3.fromRGB(120,200,255),
+    Bloodlit=Color3.fromRGB(200,40,60), Chained=Color3.fromRGB(140,140,160),
+    Starstruck=Color3.fromRGB(255,240,150), Aurora=Color3.fromRGB(232,139,255),
+}
+local MUT_MULTI = { -- fallback only, used for non-Dragon's-Breath seeds
+    Gold=10, Rainbow=30, Electric=25, Frozen=14,
+    Bloodlit=60, Chained=8, Starstruck=50, Aurora=1.5,
+}
+local function colorFor(mut)
+    if MUT_COLORS[mut] then return MUT_COLORS[mut] end
+    local h = 0
+    for i = 1, #mut do h = (h * 31 + string.byte(mut, i)) % 360 end
+    local r = math.abs((h        % 360) / 360 - 0.5) * 510
+    local g = math.abs(((h+120)  % 360) / 360 - 0.5) * 510
+    local b = math.abs(((h+240)  % 360) / 360 - 0.5) * 510
+    return Color3.fromRGB(math.clamp(255-r,80,255), math.clamp(255-g,80,255), math.clamp(255-b,80,255))
+end
+
+-- ===== Dragon's Breath fitted formulas (2026-06-18, 12 data points) =====
+-- kg = BASE_WEIGHT × SizeMulti, value(M) = a × kg^b
+local DB_BASE_WEIGHT = 7.4826
+local DB_FORMULAS = {
+    Electric   = {a=0.032254, b=1.4711},
+    Bloodlit   = {a=0.136741, b=1.3209},
+    Starstruck = {a=0.156602, b=1.2412},
+    Frozen     = {a=0.016076, b=1.5005},
+    Gold       = {a=0.000361, b=2.3728},
+    Rainbow    = {a=0.032254, b=1.4711},
+    Aurora     = {a=0.000236, b=1.9415},
+}
+
+local function valueDragonBreath(size, mut)
+    local kg = DB_BASE_WEIGHT * (size or 0)
+    local f = mut and DB_FORMULAS[mut]
+    if f then
+        return math.floor(f.a * (kg ^ f.b) * 1_000_000)
+    end
+    -- no mutation (or unknown) — rough no-mut estimate using Aurora-like base
+    -- conservative: treat as if multiplier 1 on a small base
+    return math.floor(0.0001 * (kg ^ 1.4) * 1_000_000)
+end
+
+-- generic fallback for other seeds (squared estimate)
+local function valueGeneric(seedName, size, mut)
+    local base = SVD[seedName]
+    if not base then return 0 end
+    local s = size or 0
+    local m = (mut and mut ~= "" and MUT_MULTI[mut]) or 1
+    return math.floor(base * s * s * m)
+end
+
+local function valueOf(seedName, size, mut)
+    if seedName == "Dragon's Breath" then
+        return valueDragonBreath(size, mut)
+    end
+    return valueGeneric(seedName, size, mut)
+end
+
+local function fmtMoney(v)
+    if v >= 1_000_000_000 then return string.format("$%.2fB", v/1_000_000_000) end
+    if v >= 1_000_000     then return string.format("$%.2fM", v/1_000_000) end
+    if v >= 1_000         then return string.format("$%.1fK", v/1_000) end
+    return "$"..tostring(v)
+end
+
+local function findPlot()
+    local id = lp:GetAttribute("PlotId")
+    if id then
+        local p = Workspace.Gardens:FindFirstChild("Plot"..id)
+        if p then return p end
+    end
+    for _, p in ipairs(Workspace.Gardens:GetChildren()) do
+        if p:GetAttribute("Owner") == lp.Name or p:GetAttribute("OwnerUserId") == lp.UserId then
+            return p
+        end
+    end
+end
+
+-- ---------- state ----------
+local selectedTiers  = {}
+local selectedRanges = {}
+local autoCollectOn  = false
+
+-- ---------- UI (unchanged from v4.4) ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "GAG_FruitScanner"; gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = CoreGui
+
+local main = Instance.new("Frame", gui)
+main.Size = UDim2.new(0, 460, 0, 620)
+main.Position = UDim2.new(0, 40, 0.5, -310)
+main.BackgroundColor3 = Color3.fromRGB(22,22,28); main.BorderSizePixel = 0
+main.Active = true; main.Draggable = true
+Instance.new("UICorner", main).CornerRadius = UDim.new(0,10)
+Instance.new("UIStroke", main).Color = Color3.fromRGB(60,60,80)
+
+local header = Instance.new("Frame", main)
+header.Size = UDim2.new(1,0,0,36)
+header.BackgroundColor3 = Color3.fromRGB(30,30,40); header.BorderSizePixel = 0
+Instance.new("UICorner", header).CornerRadius = UDim.new(0,10)
+
+local title = Instance.new("TextLabel", header)
+title.BackgroundTransparency = 1
+title.Size = UDim2.new(1,-120,1,0); title.Position = UDim2.new(0,12,0,0)
+title.Font = Enum.Font.GothamBold; title.Text = "🍒 Fruit Scanner v4.5 — DB fitted"
+title.TextColor3 = Color3.fromRGB(240,240,255); title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+local function mkHeaderBtn(txt, x, color)
+    local b = Instance.new("TextButton", header)
+    b.Size = UDim2.new(0,52,0,22); b.Position = UDim2.new(1,x,0.5,-11)
+    b.BackgroundColor3 = color or Color3.fromRGB(60,60,80); b.BorderSizePixel = 0
+    b.Font = Enum.Font.GothamBold; b.TextSize = 12
+    b.TextColor3 = Color3.fromRGB(240,240,255); b.Text = txt
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,5)
+    return b
+end
+local refreshBtn = mkHeaderBtn("Refresh", -118)
+local closeBtn   = mkHeaderBtn("Close", -60, Color3.fromRGB(120,40,40))
+
+local summary = Instance.new("TextLabel", main)
+summary.BackgroundColor3 = Color3.fromRGB(28,28,36); summary.BorderSizePixel = 0
+summary.Size = UDim2.new(1,-20,0,46); summary.Position = UDim2.new(0,10,0,44)
+summary.Font = Enum.Font.Gotham; summary.TextSize = 11
+summary.TextColor3 = Color3.fromRGB(220,220,235)
+summary.TextXAlignment = Enum.TextXAlignment.Left
+summary.TextYAlignment = Enum.TextYAlignment.Top
+summary.TextWrapped = true; summary.Text = ""
+Instance.new("UICorner", summary).CornerRadius = UDim.new(0,6)
+local sp = Instance.new("UIPadding", summary)
+sp.PaddingLeft = UDim.new(0,8); sp.PaddingTop = UDim.new(0,5)
+
+local filterLabel = Instance.new("TextLabel", main)
+filterLabel.BackgroundTransparency = 1
+filterLabel.Size = UDim2.new(1,-20,0,16); filterLabel.Position = UDim2.new(0,10,0,96)
+filterLabel.Font = Enum.Font.GothamSemibold; filterLabel.TextSize = 11
+filterLabel.TextColor3 = Color3.fromRGB(180,180,200)
+filterLabel.TextXAlignment = Enum.TextXAlignment.Left
+filterLabel.Text = "Auto-collect tiers (used when no value range is picked):"
+
+local filterBar = Instance.new("Frame", main)
+filterBar.BackgroundTransparency = 1
+filterBar.Size = UDim2.new(1,-20,0,28); filterBar.Position = UDim2.new(0,10,0,114)
+local fLayout = Instance.new("UIListLayout", filterBar)
+fLayout.FillDirection = Enum.FillDirection.Horizontal
+fLayout.Padding = UDim.new(0,4); fLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local function buildTierButtons()
+    local ordered = {}
+    for i = #TIERS, 1, -1 do table.insert(ordered, TIERS[i]) end
+    for i, t in ipairs(ordered) do
+        local b = Instance.new("TextButton", filterBar)
+        b.Size = UDim2.new(0,40,1,0); b.LayoutOrder = i
+        b.BackgroundColor3 = Color3.fromRGB(45,45,55); b.BorderSizePixel = 0
+        b.Font = Enum.Font.GothamBold; b.TextSize = 12
+        b.TextColor3 = Color3.fromRGB(220,220,235); b.Text = t.name
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,5)
+        local strokeB = Instance.new("UIStroke", b)
+        strokeB.Color = t.color; strokeB.Thickness = 1
+        b.MouseButton1Click:Connect(function()
+            selectedTiers[t.name] = not selectedTiers[t.name]
+            if selectedTiers[t.name] then
+                b.BackgroundColor3 = t.color; b.TextColor3 = Color3.fromRGB(20,20,20)
+                strokeB.Thickness = 2
+            else
+                b.BackgroundColor3 = Color3.fromRGB(45,45,55); b.TextColor3 = Color3.fromRGB(220,220,235)
+                strokeB.Thickness = 1
+            end
+        end)
+    end
+end
+buildTierButtons()
+
+local qsBar = Instance.new("Frame", main)
+qsBar.BackgroundTransparency = 1
+qsBar.Size = UDim2.new(1,-20,0,22); qsBar.Position = UDim2.new(0,10,0,148)
+local qsLayout = Instance.new("UIListLayout", qsBar)
+qsLayout.FillDirection = Enum.FillDirection.Horizontal; qsLayout.Padding = UDim.new(0,4)
+
+local function refreshTierButtons()
+    for _, btn in ipairs(filterBar:GetChildren()) do
+        if btn:IsA("TextButton") then
+            local tierName = btn.Text
+            local t
+            for _, tt in ipairs(TIERS) do if tt.name == tierName then t = tt; break end end
+            local strokeB = btn:FindFirstChildOfClass("UIStroke")
+            if selectedTiers[tierName] then
+                btn.BackgroundColor3 = t.color; btn.TextColor3 = Color3.fromRGB(20,20,20)
+                if strokeB then strokeB.Thickness = 2 end
+            else
+                btn.BackgroundColor3 = Color3.fromRGB(45,45,55); btn.TextColor3 = Color3.fromRGB(220,220,235)
+                if strokeB then strokeB.Thickness = 1 end
+            end
+        end
+    end
+end
+
+local function mkQS(text, fn)
+    local b = Instance.new("TextButton", qsBar)
+    b.Size = UDim2.new(0,60,1,0)
+    b.BackgroundColor3 = Color3.fromRGB(40,40,55); b.BorderSizePixel = 0
+    b.Font = Enum.Font.Gotham; b.TextSize = 11
+    b.TextColor3 = Color3.fromRGB(200,200,220); b.Text = text
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,4)
+    b.MouseButton1Click:Connect(function() fn(); refreshTierButtons() end)
+    return b
+end
+mkQS("All", function() for _,t in ipairs(TIERS) do selectedTiers[t.name]=true end end)
+mkQS("None", function() selectedTiers = {} end)
+mkQS("High", function() selectedTiers = {}; for _, n in ipairs({"T7","T8","T9"}) do selectedTiers[n]=true end end)
+mkQS("Low",  function() selectedTiers = {}; for _, n in ipairs({"T1","T2","T3"}) do selectedTiers[n]=true end end)
+
+local rangeLabel = Instance.new("TextLabel", main)
+rangeLabel.BackgroundTransparency = 1
+rangeLabel.Size = UDim2.new(1,-20,0,16); rangeLabel.Position = UDim2.new(0,10,0,178)
+rangeLabel.Font = Enum.Font.GothamSemibold; rangeLabel.TextSize = 11
+rangeLabel.TextColor3 = Color3.fromRGB(180,180,200)
+rangeLabel.TextXAlignment = Enum.TextXAlignment.Left
+rangeLabel.Text = "💰 Value ranges (multi-select — overrides tiers when picked):"
+
+local rangeBar = Instance.new("Frame", main)
+rangeBar.BackgroundTransparency = 1
+rangeBar.Size = UDim2.new(1,-20,0,28); rangeBar.Position = UDim2.new(0,10,0,196)
+local rLayout = Instance.new("UIListLayout", rangeBar)
+rLayout.FillDirection = Enum.FillDirection.Horizontal
+rLayout.Padding = UDim.new(0,4); rLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+for i, r in ipairs(RANGES) do
+    local b = Instance.new("TextButton", rangeBar)
+    b.Size = UDim2.new(0, 78, 1, 0); b.LayoutOrder = i
+    b.BackgroundColor3 = Color3.fromRGB(45,45,55); b.BorderSizePixel = 0
+    b.Font = Enum.Font.GothamBold; b.TextSize = 12
+    b.TextColor3 = Color3.fromRGB(220,220,235); b.Text = r.name
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,5)
+    local strokeB = Instance.new("UIStroke", b)
+    strokeB.Color = r.color; strokeB.Thickness = 1
+    b.MouseButton1Click:Connect(function()
+        selectedRanges[r.name] = not selectedRanges[r.name]
+        if selectedRanges[r.name] then
+            b.BackgroundColor3 = r.color; b.TextColor3 = Color3.fromRGB(20,20,20)
+            strokeB.Thickness = 2
+        else
+            b.BackgroundColor3 = Color3.fromRGB(45,45,55); b.TextColor3 = Color3.fromRGB(220,220,235)
+            strokeB.Thickness = 1
+        end
+    end)
+end
+
+local actionsBar = Instance.new("Frame", main)
+actionsBar.BackgroundTransparency = 1
+actionsBar.Size = UDim2.new(1,-20,0,30); actionsBar.Position = UDim2.new(0,10,0,232)
+
+local autoCollectBtn = Instance.new("TextButton", actionsBar)
+autoCollectBtn.Size = UDim2.new(1/3,-3,1,0); autoCollectBtn.Position = UDim2.new(0,0,0,0)
+autoCollectBtn.BackgroundColor3 = Color3.fromRGB(60,90,60); autoCollectBtn.BorderSizePixel = 0
+autoCollectBtn.Font = Enum.Font.GothamBold; autoCollectBtn.TextSize = 11
+autoCollectBtn.TextColor3 = Color3.fromRGB(240,240,255)
+autoCollectBtn.Text = "🌾 Auto: OFF"
+Instance.new("UICorner", autoCollectBtn).CornerRadius = UDim.new(0,6)
+
+local collectRangeBtn = Instance.new("TextButton", actionsBar)
+collectRangeBtn.Size = UDim2.new(1/3,-3,1,0); collectRangeBtn.Position = UDim2.new(1/3,2,0,0)
+collectRangeBtn.BackgroundColor3 = Color3.fromRGB(60,120,160); collectRangeBtn.BorderSizePixel = 0
+collectRangeBtn.Font = Enum.Font.GothamBold; collectRangeBtn.TextSize = 11
+collectRangeBtn.TextColor3 = Color3.fromRGB(240,240,255)
+collectRangeBtn.Text = "💰 Collect Range"
+Instance.new("UICorner", collectRangeBtn).CornerRadius = UDim.new(0,6)
+
+local collectMutBtn = Instance.new("TextButton", actionsBar)
+collectMutBtn.Size = UDim2.new(1/3,-3,1,0); collectMutBtn.Position = UDim2.new(2/3,4,0,0)
+collectMutBtn.BackgroundColor3 = Color3.fromRGB(100,60,140); collectMutBtn.BorderSizePixel = 0
+collectMutBtn.Font = Enum.Font.GothamBold; collectMutBtn.TextSize = 11
+collectMutBtn.TextColor3 = Color3.fromRGB(240,240,255)
+collectMutBtn.Text = "✨ Mutated"
+Instance.new("UICorner", collectMutBtn).CornerRadius = UDim.new(0,6)
+
+local scroll = Instance.new("ScrollingFrame", main)
+scroll.Size = UDim2.new(1,-20,1,-282); scroll.Position = UDim2.new(0,10,0,270)
+scroll.BackgroundColor3 = Color3.fromRGB(18,18,24); scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 5; scroll.ScrollBarImageColor3 = Color3.fromRGB(80,80,110)
+scroll.CanvasSize = UDim2.new(0,0,0,0); scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Instance.new("UICorner", scroll).CornerRadius = UDim.new(0,6)
+local lay = Instance.new("UIListLayout", scroll); lay.Padding = UDim.new(0,3)
+lay.SortOrder = Enum.SortOrder.LayoutOrder
+local sPad = Instance.new("UIPadding", scroll)
+sPad.PaddingLeft = UDim.new(0,5); sPad.PaddingRight = UDim.new(0,5)
+sPad.PaddingTop  = UDim.new(0,5); sPad.PaddingBottom = UDim.new(0,5)
+
+-- ---------- row renderer ----------
+local function makeRow(fruit, seedName, order)
+    local size = fruit:GetAttribute("SizeMulti") or 0
+    local mut  = fruit:GetAttribute("Mutation")
+    local tier = tierOf(size)
+    local val  = valueOf(seedName, size, mut)
+
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,0,0,32)
+    row.BackgroundColor3 = Color3.fromRGB(28,28,36); row.BorderSizePixel = 0
+    row.LayoutOrder = order
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0,5)
+
+    local tierBadge = Instance.new("TextLabel", row)
+    tierBadge.Size = UDim2.new(0,32,0,22); tierBadge.Position = UDim2.new(0,6,0.5,-11)
+    tierBadge.BackgroundColor3 = tier.color; tierBadge.BorderSizePixel = 0
+    tierBadge.Font = Enum.Font.GothamBold; tierBadge.TextSize = 12
+    tierBadge.TextColor3 = Color3.fromRGB(20,20,20); tierBadge.Text = tier.name
+    Instance.new("UICorner", tierBadge).CornerRadius = UDim.new(0,4)
+
+    local nameLbl = Instance.new("TextLabel", row)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Size = UDim2.new(0,130,1,0); nameLbl.Position = UDim2.new(0,46,0,0)
+    nameLbl.Font = Enum.Font.GothamSemibold; nameLbl.TextSize = 12
+    nameLbl.TextColor3 = Color3.fromRGB(235,235,250); nameLbl.Text = seedName
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+    local hasMut = mut and mut ~= ""
+    local badgeText = ""
+    if hasMut then
+        local mx = MUT_MULTI[mut]
+        if mx and mx > 1 then badgeText = string.format("%s x%g", mut, mx)
+        else badgeText = mut end
+    end
+    local badgeW = hasMut and math.max(70, #badgeText * 7 + 14) or 0
+
+    local valLbl = Instance.new("TextLabel", row)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Size = UDim2.new(0, 78, 1, 0)
+    valLbl.Position = UDim2.new(1, -(badgeW + (hasMut and 72 or 10) + 64), 0, 0)
+    valLbl.Font = Enum.Font.GothamBold; valLbl.TextSize = 12
+    valLbl.TextColor3 = Color3.fromRGB(120,255,160)
+    valLbl.Text = val > 0 and fmtMoney(val) or "-"
+    valLbl.TextXAlignment = Enum.TextXAlignment.Right
+
+    local sizeLbl = Instance.new("TextLabel", row)
+    sizeLbl.BackgroundTransparency = 1
+    sizeLbl.Size = UDim2.new(0,60,1,0)
+    sizeLbl.Position = UDim2.new(1, -(badgeW + (hasMut and 72 or 10)), 0, 0)
+    sizeLbl.Font = Enum.Font.GothamBold; sizeLbl.TextSize = 12
+    sizeLbl.TextColor3 = Color3.fromRGB(255,220,120)
+    sizeLbl.Text = string.format("x%.2f", size)
+    sizeLbl.TextXAlignment = Enum.TextXAlignment.Right
+
+    if hasMut then
+        local mBadge = Instance.new("TextLabel", row)
+        mBadge.Size = UDim2.new(0, badgeW, 0, 20)
+        mBadge.Position = UDim2.new(1, -(badgeW + 8), 0.5, -10)
+        mBadge.BackgroundColor3 = colorFor(mut); mBadge.BorderSizePixel = 0
+        mBadge.Font = Enum.Font.GothamBold; mBadge.TextSize = 11
+        mBadge.TextColor3 = Color3.fromRGB(20,20,20); mBadge.Text = badgeText
+        Instance.new("UICorner", mBadge).CornerRadius = UDim.new(0,4)
+    end
+    return row
+end
+
+-- ---------- scan ----------
+local function clearList()
+    for _, c in ipairs(scroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+end
+
+local function scan()
+    clearList()
+    local plot = findPlot()
+    if not plot then summary.Text = "❌ No plot."; return end
+    local plants = plot:FindFirstChild("Plants")
+    if not plants then summary.Text = "❌ No Plants folder."; return end
+
+    local rows, tierCounts, mutCount, mutTypes, total = {}, {}, 0, {}, 0
+    for _, plant in ipairs(plants:GetChildren()) do
+        local seed = plant:GetAttribute("SeedName") or "?"
+        local fruits = plant:FindFirstChild("Fruits")
+        if fruits then
+            for _, fruit in ipairs(fruits:GetChildren()) do
+                total += 1
+                local size = fruit:GetAttribute("SizeMulti") or 0
+                local mut  = fruit:GetAttribute("Mutation")
+                local tier = tierOf(size)
+                local val  = valueOf(seed, size, mut)
+                tierCounts[tier.name] = (tierCounts[tier.name] or 0) + 1
+                if mut and mut ~= "" then
+                    mutCount += 1
+                    mutTypes[mut] = (mutTypes[mut] or 0) + 1
+                end
+                table.insert(rows, {fruit=fruit, plant=plant, seed=seed, size=size, mut=mut, tier=tier, val=val})
+            end
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.val ~= b.val then return a.val > b.val end
+        return a.size > b.size
+    end)
+    for i, r in ipairs(rows) do makeRow(r.fruit, r.seed, i).Parent = scroll end
+
+    local tline = ""
+    for _, t in ipairs(TIERS) do
+        local c = tierCounts[t.name] or 0
+        if c > 0 then tline = tline..string.format("%s:%d  ", t.name, c) end
+    end
+    local mline = ""
+    for m, c in pairs(mutTypes) do mline = mline..string.format("%s:%d  ", m, c) end
+    summary.Text = string.format("Plot: %s  |  Fruits: %d  |  Mutated: %d\n%s%s",
+        plot.Name, total, mutCount,
+        tline ~= "" and tline or "(no fruits) ",
+        mline ~= "" and "\n"..mline or "")
+end
+
+-- ---------- collect ----------
+local function fireCollect(plant, fruit)
+    local pid = plant:GetAttribute("PlantId")
+    local fid = fruit:GetAttribute("FruitId")
+    if not pid or not fid then return false end
+    return pcall(function()
+        Networking.Garden.CollectFruit:Fire(pid, fid)
+    end)
+end
+
+local function collectAllMutated()
+    local plot = findPlot()
+    if not plot or not plot:FindFirstChild("Plants") then return 0 end
+    local count = 0
+    pcall(function() lp.ReplicationFocus = lp.Character end)
+    for _, plant in ipairs(plot.Plants:GetChildren()) do
+        local fruits = plant:FindFirstChild("Fruits")
+        if fruits then
+            for _, fruit in ipairs(fruits:GetChildren()) do
+                local mut = fruit:GetAttribute("Mutation")
+                if mut and typeof(mut) == "string" and mut ~= "" then
+                    if fireCollect(plant, fruit) then
+                        count += 1; task.wait(0.03)
+                    end
+                end
+            end
+        end
+    end
+    return count
+end
+
+local function collectInRanges()
+    local plot = findPlot()
+    if not plot or not plot:FindFirstChild("Plants") then return 0 end
+    if not anyRangeSelected(selectedRanges) then return 0 end
+    local count = 0
+    pcall(function() lp.ReplicationFocus = lp.Character end)
+    for _, plant in ipairs(plot.Plants:GetChildren()) do
+        local seed = plant:GetAttribute("SeedName") or "?"
+        local fruits = plant:FindFirstChild("Fruits")
+        if fruits then
+            for _, fruit in ipairs(fruits:GetChildren()) do
+                local size   = fruit:GetAttribute("SizeMulti") or 0
+                local mut    = fruit:GetAttribute("Mutation")
+                local age    = fruit:GetAttribute("Age") or 0
+                local maxAge = fruit:GetAttribute("MaxAge") or 0
+                if age >= maxAge and maxAge > 0 then
+                    local val = valueOf(seed, size, mut)
+                    if inAnySelectedRange(val, selectedRanges) then
+                        if fireCollect(plant, fruit) then
+                            count += 1; task.wait(0.03)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return count
+end
+
+local function autoCollectStep()
+    local plot = findPlot()
+    if not plot or not plot:FindFirstChild("Plants") then return 0 end
+    local useRanges = anyRangeSelected(selectedRanges)
+    local count = 0
+    pcall(function() lp.ReplicationFocus = lp.Character end)
+    for _, plant in ipairs(plot.Plants:GetChildren()) do
+        local seed = plant:GetAttribute("SeedName") or "?"
+        local fruits = plant:FindFirstChild("Fruits")
+        if fruits then
+            for _, fruit in ipairs(fruits:GetChildren()) do
+                local size   = fruit:GetAttribute("SizeMulti") or 0
+                local mut    = fruit:GetAttribute("Mutation")
+                local age    = fruit:GetAttribute("Age") or 0
+                local maxAge = fruit:GetAttribute("MaxAge") or 0
+                if age >= maxAge and maxAge > 0 then
+                    local match = false
+                    if useRanges then
+                        local val = valueOf(seed, size, mut)
+                        if inAnySelectedRange(val, selectedRanges) then match = true end
+                    else
+                        local tier = tierOf(size)
+                        if selectedTiers[tier.name] then match = true end
+                    end
+                    if match and fireCollect(plant, fruit) then
+                        count += 1; task.wait(0.03)
+                    end
+                end
+            end
+        end
+    end
+    return count
+end
+
+-- ---------- handlers ----------
+collectMutBtn.MouseButton1Click:Connect(function()
+    collectMutBtn.Text = "✨ ..."
+    local n = collectAllMutated()
+    collectMutBtn.Text = "✨ "..n.."!"
+    task.wait(1.5); collectMutBtn.Text = "✨ Mutated"; scan()
+end)
+
+collectRangeBtn.MouseButton1Click:Connect(function()
+    if not anyRangeSelected(selectedRanges) then
+        collectRangeBtn.Text = "💰 Pick a range!"
+        task.wait(1.5); collectRangeBtn.Text = "💰 Collect Range"
+        return
+    end
+    collectRangeBtn.Text = "💰 ..."
+    local n = collectInRanges()
+    collectRangeBtn.Text = "💰 "..n.."!"
+    task.wait(1.5); collectRangeBtn.Text = "💰 Collect Range"; scan()
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if autoCollectOn then autoCollectStep() end
+    end
+end)
+
+autoCollectBtn.MouseButton1Click:Connect(function()
+    autoCollectOn = not autoCollectOn
+    if autoCollectOn then
+        autoCollectBtn.Text = "🌾 Auto: ON"
+        autoCollectBtn.BackgroundColor3 = Color3.fromRGB(60,140,60)
+    else
+        autoCollectBtn.Text = "🌾 Auto: OFF"
+        autoCollectBtn.BackgroundColor3 = Color3.fromRGB(60,90,60)
+    end
+end)
+
+refreshBtn.MouseButton1Click:Connect(scan)
+closeBtn.MouseButton1Click:Connect(function()
+    autoCollectOn = false
+    gui:Destroy()
+end)
+
+scan()
+print("[FruitScanner v4.5] loaded — Dragon's Breath uses fitted power-law formulas")

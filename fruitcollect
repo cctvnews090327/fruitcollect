@@ -22,7 +22,7 @@ pcall(function() SVD = require(RS.SharedModules.SellValueData) end)
 
 -- ===== TUNING =====
 local AUTO_LOOP_WAIT    = 0.4    -- was 2.0
-local PER_FRUIT_WAIT    = 0.01  -- was 0.03
+local PER_FRUIT_WAIT    = 0.0001  -- was 0.03
 local IDLE_LOOP_WAIT    = 0.4    -- wait when nothing collected last pass
 
 -- ---------- tiers ----------

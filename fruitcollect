@@ -1,10 +1,14 @@
 -- ============================================================
--- GAG2 Fruit Scanner v4.6
--- Changes from v4.5:
---   * Auto-collect loop: 2.0s -> 0.4s
---   * Per-fruit fire delay: 0.03s -> 0.015s
---   * No wait between scan passes if nothing collected
---   * Aurora flagged as "needs refit" in tooltip text
+-- GAG2 Fruit Scanner v4.7
+-- Changes from v4.6:
+--   * REAL value formula extracted from ReplicatedStorage.SharedModules.FruitValueCalc
+--   * Size exponent 2.65 (default), 1.9 Mushroom, 1.75 Bamboo
+--   * Diminishing returns past size 5 (knee), tail exponent 1.5
+--   * Single-harvest crops get scaled mutation bonus: 1 + (m-1)*0.15
+--   * Carrot enforced minimum value of 4
+--   * Removed bogus Dragon's Breath power-curve math (it's just base*size^2.65)
+--   * Mutation multipliers verified against MutationData submodules
+--   * Aurora "?" flag removed (1.5x is confirmed correct)
 -- ============================================================
 if game:GetService("CoreGui"):FindFirstChild("GAG_FruitScanner") then
     game:GetService("CoreGui").GAG_FruitScanner:Destroy()
@@ -21,9 +25,56 @@ local SVD = {}
 pcall(function() SVD = require(RS.SharedModules.SellValueData) end)
 
 -- ===== TUNING =====
-local AUTO_LOOP_WAIT    = 0.4    -- was 2.0
-local PER_FRUIT_WAIT    = 0.0001  -- was 0.03
-local IDLE_LOOP_WAIT    = 0.4    -- wait when nothing collected last pass
+local AUTO_LOOP_WAIT    = 0.4
+local PER_FRUIT_WAIT    = 0.0001
+local IDLE_LOOP_WAIT    = 0.4
+
+-- ===== REAL formula from FruitValueCalc =====
+local SIZE_EXPONENT_DEFAULT = 2.65
+local SIZE_EXPONENT_OVERRIDES = {
+    Mushroom = 1.9,
+    Bamboo   = 1.75,
+}
+local KNEE          = 5         -- diminishing returns kick in above this size
+local TAIL_EXPONENT = 1.5
+local SINGLE_HARVEST_SCALE = 0.15
+local MIN_VALUES = { Carrot = 4 }
+
+local SINGLE_HARVEST = {
+    Carrot=true, Tulip=true, Bamboo=true, Mushroom=true, ["Green Bean"]=true,
+}
+
+-- Mutation price multipliers (verified from MutationData submodules)
+local MUT_MULTI = {
+    Gold=10, Rainbow=30, Electric=25, Frozen=14,
+    Bloodlit=60, Chained=8, Starstruck=50, Aurora=1.5,
+}
+
+local function sizeFactor(seedName, size)
+    local exp = SIZE_EXPONENT_OVERRIDES[seedName] or SIZE_EXPONENT_DEFAULT
+    if size <= KNEE then
+        return size ^ exp
+    end
+    return (KNEE ^ exp) * ((size / KNEE) ^ math.min(TAIL_EXPONENT, exp))
+end
+
+local function mutationFactor(seedName, mut)
+    if not mut or mut == "" then return 1 end
+    local m = MUT_MULTI[mut] or 1
+    if SINGLE_HARVEST[seedName] and m > 1 then
+        return 1 + (m - 1) * SINGLE_HARVEST_SCALE
+    end
+    return m
+end
+
+local function valueOf(seedName, size, mut)
+    local base = SVD[seedName]
+    if not base then return 0 end
+    local v = math.floor(base * sizeFactor(seedName, size or 0) * mutationFactor(seedName, mut))
+    local minV = MIN_VALUES[seedName]
+    if minV and v < minV then v = minV end
+    return v
+end
 
 -- ---------- tiers ----------
 local TIERS = {
@@ -68,10 +119,6 @@ local MUT_COLORS = {
     Bloodlit=Color3.fromRGB(200,40,60), Chained=Color3.fromRGB(140,140,160),
     Starstruck=Color3.fromRGB(255,240,150), Aurora=Color3.fromRGB(232,139,255),
 }
-local MUT_MULTI = {
-    Gold=10, Rainbow=30, Electric=25, Frozen=14,
-    Bloodlit=60, Chained=8, Starstruck=50, Aurora=1.5,
-}
 local function colorFor(mut)
     if MUT_COLORS[mut] then return MUT_COLORS[mut] end
     local h = 0
@@ -80,41 +127,6 @@ local function colorFor(mut)
     local g = math.abs(((h+120)  % 360) / 360 - 0.5) * 510
     local b = math.abs(((h+240)  % 360) / 360 - 0.5) * 510
     return Color3.fromRGB(math.clamp(255-r,80,255), math.clamp(255-g,80,255), math.clamp(255-b,80,255))
-end
-
-local DB_BASE_WEIGHT = 7.4826
-local DB_FORMULAS = {
-    Electric   = {a=0.032254, b=1.4711},
-    Bloodlit   = {a=0.136741, b=1.3209},
-    Starstruck = {a=0.156602, b=1.2412},
-    Frozen     = {a=0.016076, b=1.5005},
-    Gold       = {a=0.000361, b=2.3728},
-    Rainbow    = {a=0.032254, b=1.4711},
-    Aurora     = {a=0.000236, b=1.9415}, -- TODO: needs refit with new in-game data
-}
-
-local function valueDragonBreath(size, mut)
-    local kg = DB_BASE_WEIGHT * (size or 0)
-    local f = mut and DB_FORMULAS[mut]
-    if f then
-        return math.floor(f.a * (kg ^ f.b) * 1_000_000)
-    end
-    return math.floor(0.0001 * (kg ^ 1.4) * 1_000_000)
-end
-
-local function valueGeneric(seedName, size, mut)
-    local base = SVD[seedName]
-    if not base then return 0 end
-    local s = size or 0
-    local m = (mut and mut ~= "" and MUT_MULTI[mut]) or 1
-    return math.floor(base * s * s * m)
-end
-
-local function valueOf(seedName, size, mut)
-    if seedName == "Dragon's Breath" then
-        return valueDragonBreath(size, mut)
-    end
-    return valueGeneric(seedName, size, mut)
 end
 
 local function fmtMoney(v)
@@ -162,7 +174,7 @@ Instance.new("UICorner", header).CornerRadius = UDim.new(0,10)
 local title = Instance.new("TextLabel", header)
 title.BackgroundTransparency = 1
 title.Size = UDim2.new(1,-120,1,0); title.Position = UDim2.new(0,12,0,0)
-title.Font = Enum.Font.GothamBold; title.Text = "🍒 Fruit Scanner v4.6 — fast collect"
+title.Font = Enum.Font.GothamBold; title.Text = "🍒 Fruit Scanner v4.7 — real formula"
 title.TextColor3 = Color3.fromRGB(240,240,255); title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 
@@ -377,9 +389,17 @@ local function makeRow(fruit, seedName, order)
     local badgeText = ""
     if hasMut then
         local mx = MUT_MULTI[mut]
-        if mx and mx > 1 then badgeText = string.format("%s x%g", mut, mx)
-        else badgeText = mut end
-        if mut == "Aurora" then badgeText = badgeText .. " ?" end -- flag for refit
+        -- Show effective multiplier (scaled for single-harvest crops)
+        local eff = mutationFactor(seedName, mut)
+        if mx and mx > 1 then
+            if SINGLE_HARVEST[seedName] then
+                badgeText = string.format("%s x%.2f", mut, eff)
+            else
+                badgeText = string.format("%s x%g", mut, mx)
+            end
+        else
+            badgeText = mut
+        end
     end
     local badgeW = hasMut and math.max(70, #badgeText * 7 + 14) or 0
 
@@ -388,7 +408,7 @@ local function makeRow(fruit, seedName, order)
     valLbl.Size = UDim2.new(0, 78, 1, 0)
     valLbl.Position = UDim2.new(1, -(badgeW + (hasMut and 72 or 10) + 64), 0, 0)
     valLbl.Font = Enum.Font.GothamBold; valLbl.TextSize = 12
-    valLbl.TextColor3 = (mut == "Aurora") and Color3.fromRGB(255,180,100) or Color3.fromRGB(120,255,160)
+    valLbl.TextColor3 = Color3.fromRGB(120,255,160)
     valLbl.Text = val > 0 and fmtMoney(val) or "-"
     valLbl.TextXAlignment = Enum.TextXAlignment.Right
 
@@ -578,7 +598,6 @@ collectRangeBtn.MouseButton1Click:Connect(function()
     task.wait(1.5); collectRangeBtn.Text = "💰 Collect Range"; scan()
 end)
 
--- Faster auto-collect loop: no fixed 2s gap, adapts to activity
 task.spawn(function()
     while true do
         if autoCollectOn then
@@ -607,7 +626,7 @@ end)
 
 -- ---------- minimize ----------
 local minimized   = false
-local fullHeight  = main.Size.Y.Offset  -- remember full height (620)
+local fullHeight  = main.Size.Y.Offset
 local HEADER_ONLY = 36
 
 local function setMinimized(state)
@@ -635,5 +654,5 @@ closeBtn.MouseButton1Click:Connect(function()
 end)
 
 scan()
-print("[FruitScanner v4.6] loaded — faster auto-collect (loop=0.4s, per-fruit=0.015s)")
-print("[FruitScanner v4.6] Aurora flagged with '?' — formula needs refit, send new sample data")
+print("[FruitScanner v4.7] loaded — real formula from FruitValueCalc")
+print("[FruitScanner v4.7] size exponent 2.65, knee at size 5, tail 1.5")

@@ -28,9 +28,9 @@ local SVD = {}
 pcall(function() SVD = require(RS.SharedModules.SellValueData) end)
 
 -- ===== TUNING =====
-local AUTO_LOOP_WAIT    = 0.25
+local AUTO_LOOP_WAIT    = 0.05
 local PER_FRUIT_WAIT    = 0.0001
-local IDLE_LOOP_WAIT    = 0.4
+local IDLE_LOOP_WAIT    = 0.2
 local FALLBACK_KG       = 7.5     -- used if we can't resolve a seed's base kg
 local DEFAULT_KG_THRESH = 5.0
 

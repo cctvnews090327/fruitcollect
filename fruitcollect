@@ -246,7 +246,7 @@ task.spawn(function()
             pendingSell = false
             sellAll()
         end
-        task.wait(0.05)
+        task.wait(0.02)
     end
 end)
 
@@ -718,29 +718,63 @@ local function autoCollectStep()
                     local size   = fruit:GetAttribute("SizeMulti") or 0
                     local age    = fruit:GetAttribute("Age") or 0
                     local maxAge = fruit:GetAttribute("MaxAge") or 0
-                    if age >= maxAge and maxAge > 0 and kgOf(seed, size) < kgThreshold then
-                        table.insert(batch, {plant, fruit})
+                    local ripe   = (maxAge > 0 and age >= maxAge)
+                                or (maxAge == 0)
+                                or (fruit:GetAttribute("Ripe") == true)
+                    if ripe and kgOf(seed, size) < kgThreshold then
+                        table.insert(batch, {plant, fruit, nil})
+                    end
+                end
+            else
+                -- single-harvest plants: no Fruits folder, use ProximityPrompt
+                if SINGLE_HARVEST[seed] then
+                    local hp = plant:FindFirstChild("HarvestPart")
+                    local prompt = hp and hp:FindFirstChildOfClass("ProximityPrompt")
+                    local growReady = plant:GetAttribute("PlantGrowthReady")
+                    if prompt and growReady and kgOf(seed, 1) < kgThreshold then
+                        table.insert(batch, {plant, nil, prompt})
                     end
                 end
             end
         end
     end
 
+    local function fireItem(item)
+        if item[3] then
+            pcall(function()
+                item[3].Parent.CFrame = lp.Character.HumanoidRootPart.CFrame
+                fireproximityprompt(item[3])
+            end)
+        else
+            fireCollect(item[1], item[2])
+        end
+    end
+
     local count = 0
-    -- Fire 2 at a time via task.spawn, then flag a sell.
     for i = 1, #batch, 2 do
         local a = batch[i]
         local b = batch[i+1]
-        task.spawn(function() if fireCollect(a[1], a[2]) then end end)
+        task.spawn(function() fireItem(a) end)
         if b then
-            task.spawn(function() if fireCollect(b[1], b[2]) then end end)
+            task.spawn(function() fireItem(b) end)
             count += 2
         else
             count += 1
         end
-        pendingSell = true   -- fires SellAll within ~50ms
+        pendingSell = true
         task.wait(PER_FRUIT_WAIT)
     end
+
+    -- retry sweep: re-fire anything the wrapper silently dropped
+    task.wait(0.15)
+    for _, item in ipairs(batch) do
+        local fruit = item[2]
+        if fruit and fruit.Parent then
+            task.spawn(function() fireItem(item) end)
+            pendingSell = true
+        end
+    end
+
     return count
 end
 
@@ -824,4 +858,15 @@ for _ in pairs(BASE_KG) do resolved += 1 end
 print(string.format("[FruitScanner v5.0] loaded — resolved base kg for %d seeds", resolved))
 if resolved == 0 then
     print("[FruitScanner v5.0] no base kg data found — falling back to "..FALLBACK_KG.." per unit for all seeds (rows will show ~)")
+end
+
+-- diagnostic: list candidate modules so we can pin the real base kg source
+print("[FruitScanner v5.0] scanning ReplicatedStorage for weight modules...")
+for _, m in ipairs(RS:GetDescendants()) do
+    if m:IsA("ModuleScript") then
+        local n = m.Name:lower()
+        if n:find("fruit") or n:find("weight") or n:find("seed") or n:find("size") then
+            print("  candidate:", m:GetFullName())
+        end
+    end
 end

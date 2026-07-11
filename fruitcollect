@@ -1,16 +1,17 @@
 -- ============================================================
--- GAG2 Fruit Scanner v4.9
--- Changes from v4.8:
---   * REMOVED tier-list filter UI (T1..T9 buttons + All/None/High/Low).
---     Tier badges still render on each row for at-a-glance color.
---   * NEW: kg threshold input. Ripe fruits with weight < threshold get
---     collected by the auto loop (cleanup mode for low-value trash).
---     weight_kg = SizeMulti * KG_PER_UNIT   (KG_PER_UNIT = 7.5)
---   * NEW: When the auto loop collects via the kg threshold, it fires
---     Networking.NPCS.SellAll after the sweep so inventory doesn't clog.
---     Range collection and Mutated collection do NOT auto-sell — those
---     are the "keep the good stuff, sell manually" paths.
---   * Fruit-type filter still applies to every collect path.
+-- GAG2 Fruit Scanner v5.0
+-- Changes from v4.9:
+--   * Per-seed base kg + base value discovery. Scans ReplicatedStorage
+--     for modules that look like fruit/seed data and pulls out
+--     BaseWeight / BaseKg / Weight fields. Falls back to 7.5 per unit
+--     for any seed we couldn't resolve.
+--   * kg display now = base_kg[seed] * SizeMulti (was flat 7.5 * SizeMulti).
+--   * Tier badge REMOVED. Row now shows a colored kg badge with the
+--     real weight of that fruit. Color band still there, but keyed on
+--     the fruit's SizeMulti grade so high-grade fruits still pop.
+--   * Auto-sell is INSTANT: fires right after each collect pair.
+--     SELL_COOLDOWN reduced to 0 for the auto path.
+--   * Auto-loop collects 2 fruits per tick via task.spawn.
 -- ============================================================
 if game:GetService("CoreGui"):FindFirstChild("GAG_FruitScanner") then
     game:GetService("CoreGui").GAG_FruitScanner:Destroy()
@@ -27,19 +28,86 @@ local SVD = {}
 pcall(function() SVD = require(RS.SharedModules.SellValueData) end)
 
 -- ===== TUNING =====
-local AUTO_LOOP_WAIT    = 0.4
+local AUTO_LOOP_WAIT    = 0.25
 local PER_FRUIT_WAIT    = 0.0001
 local IDLE_LOOP_WAIT    = 0.4
-local KG_PER_UNIT       = 7.5     -- SizeMulti 1.0 == 7.5 kg
-local DEFAULT_KG_THRESH = 5.0     -- collect anything under 5kg by default
-local SELL_COOLDOWN     = 0.05     -- min seconds between SellAll calls
+local FALLBACK_KG       = 7.5     -- used if we can't resolve a seed's base kg
+local DEFAULT_KG_THRESH = 5.0
+
+-- ===== per-seed base kg discovery =====
+-- We scan ReplicatedStorage for modules whose values look like fruit records
+-- and pull out weight-like fields. This is best-effort; misses fall back to
+-- FALLBACK_KG so the script still works.
+local BASE_KG = {}
+
+local WEIGHT_KEYS = {
+    "BaseWeight","BaseKg","BaseKG","BaseSize","Weight","Kg","KG",
+    "baseWeight","baseKg","baseSize","weight","kg",
+    "DefaultWeight","AverageWeight","AvgWeight",
+}
+
+local function extractWeight(record)
+    if typeof(record) ~= "table" then return nil end
+    for _, key in ipairs(WEIGHT_KEYS) do
+        local v = record[key]
+        if typeof(v) == "number" and v > 0 then return v end
+    end
+    -- nested: record.Stats.Weight etc
+    for _, sub in pairs(record) do
+        if typeof(sub) == "table" then
+            for _, key in ipairs(WEIGHT_KEYS) do
+                local v = sub[key]
+                if typeof(v) == "number" and v > 0 then return v end
+            end
+        end
+    end
+    return nil
+end
+
+local function scanModule(mod)
+    local ok, data = pcall(require, mod)
+    if not ok or typeof(data) ~= "table" then return end
+    for k, v in pairs(data) do
+        if typeof(k) == "string" and SVD[k] then  -- known seed name
+            local w = extractWeight(v)
+            if w then BASE_KG[k] = w end
+        end
+    end
+end
+
+local function scanForBaseKg()
+    local scanned = 0
+    local function walk(root)
+        for _, child in ipairs(root:GetChildren()) do
+            if child:IsA("ModuleScript") then
+                local n = child.Name:lower()
+                if n:find("fruit") or n:find("seed") or n:find("plant")
+                   or n:find("weight") or n:find("size") or n:find("data")
+                   or n:find("info") or n:find("config") then
+                    scanModule(child)
+                    scanned += 1
+                    if scanned > 40 then return end
+                end
+            elseif child:IsA("Folder") or child:IsA("Configuration") then
+                walk(child)
+            end
+        end
+    end
+    pcall(function() walk(RS) end)
+end
+scanForBaseKg()
+
+local function baseKgOf(seedName)
+    return BASE_KG[seedName] or FALLBACK_KG
+end
+
+local function kgOf(seedName, sizeMulti)
+    return baseKgOf(seedName) * (sizeMulti or 0)
+end
 
 -- ===== REAL formula from FruitValueCalc =====
 local SIZE_EXPONENT_DEFAULT = 2.65
-local SIZE_EXPONENT_OVERRIDES = {
-    Mushroom = 1.9,
-    Bamboo   = 1.75,
-}
+local SIZE_EXPONENT_OVERRIDES = { Mushroom = 1.9, Bamboo = 1.75 }
 local KNEE          = 5
 local TAIL_EXPONENT = 1.5
 local SINGLE_HARVEST_SCALE = 0.15
@@ -56,9 +124,7 @@ local MUT_MULTI = {
 
 local function sizeFactor(seedName, size)
     local exp = SIZE_EXPONENT_OVERRIDES[seedName] or SIZE_EXPONENT_DEFAULT
-    if size <= KNEE then
-        return size ^ exp
-    end
+    if size <= KNEE then return size ^ exp end
     return (KNEE ^ exp) * ((size / KNEE) ^ math.min(TAIL_EXPONENT, exp))
 end
 
@@ -80,25 +146,23 @@ local function valueOf(seedName, size, mut)
     return v
 end
 
-local function kgOf(size) return (size or 0) * KG_PER_UNIT end
-
--- ---------- tiers (display-only now) ----------
-local TIERS = {
-    {min=15.0, max=math.huge, name="T9", color=Color3.fromRGB(255,80,255)},
-    {min=6.0, max=15.0,      name="T8", color=Color3.fromRGB(255,40,90)},
-    {min=5.0, max=6.0,       name="T7", color=Color3.fromRGB(255,140,0)},
-    {min=4.0, max=5.0,       name="T6", color=Color3.fromRGB(255,210,0)},
-    {min=3.0, max=4.0,       name="T5", color=Color3.fromRGB(120,220,90)},
-    {min=2.0, max=3.0,       name="T4", color=Color3.fromRGB(80,200,200)},
-    {min=1.5, max=2.0,       name="T3", color=Color3.fromRGB(90,150,255)},
-    {min=1.0, max=1.5,       name="T2", color=Color3.fromRGB(170,170,170)},
-    {min=0.0, max=1.0,       name="T1", color=Color3.fromRGB(120,120,120)},
+-- ---------- kg badge color (keyed on SizeMulti grade) ----------
+local KG_BANDS = {
+    {min=15.0, color=Color3.fromRGB(255,80,255)},
+    {min=6.0,  color=Color3.fromRGB(255,40,90)},
+    {min=5.0,  color=Color3.fromRGB(255,140,0)},
+    {min=4.0,  color=Color3.fromRGB(255,210,0)},
+    {min=3.0,  color=Color3.fromRGB(120,220,90)},
+    {min=2.0,  color=Color3.fromRGB(80,200,200)},
+    {min=1.5,  color=Color3.fromRGB(90,150,255)},
+    {min=1.0,  color=Color3.fromRGB(170,170,170)},
+    {min=0.0,  color=Color3.fromRGB(120,120,120)},
 }
-local function tierOf(size)
-    for _, t in ipairs(TIERS) do
-        if size >= t.min and size < t.max then return t end
+local function colorForSize(size)
+    for _, b in ipairs(KG_BANDS) do
+        if size >= b.min then return b.color end
     end
-    return TIERS[#TIERS]
+    return KG_BANDS[#KG_BANDS].color
 end
 
 local RANGES = {
@@ -159,7 +223,7 @@ local selectedRanges = {}
 local selectedFruits = {}
 local autoCollectOn  = false
 local kgThreshold    = DEFAULT_KG_THRESH
-local lastSellAt     = 0
+local pendingSell    = false  -- flag flipped on by collect, drained by sell loop
 
 local function anyFruitSelected()
     for _ in pairs(selectedFruits) do return true end
@@ -172,8 +236,19 @@ end
 
 local function sellAll()
     pcall(function() Networking.NPCS.SellAll:Fire() end)
-    lastSellAt = os.clock()
 end
+
+-- Dedicated sell loop — checks the pending flag on a tight interval so
+-- SellAll fires almost immediately after any collect happens.
+task.spawn(function()
+    while true do
+        if pendingSell then
+            pendingSell = false
+            sellAll()
+        end
+        task.wait(0.05)
+    end
+end)
 
 -- ---------- UI ----------
 local gui = Instance.new("ScreenGui")
@@ -197,7 +272,7 @@ Instance.new("UICorner", header).CornerRadius = UDim.new(0,10)
 local title = Instance.new("TextLabel", header)
 title.BackgroundTransparency = 1
 title.Size = UDim2.new(1,-120,1,0); title.Position = UDim2.new(0,12,0,0)
-title.Font = Enum.Font.GothamBold; title.Text = "🍒 Fruit Scanner v4.9 — kg threshold + autosell"
+title.Font = Enum.Font.GothamBold; title.Text = "🍒 Fruit Scanner v5.0 — real kg + fast sell"
 title.TextColor3 = Color3.fromRGB(240,240,255); title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 
@@ -226,7 +301,7 @@ Instance.new("UICorner", summary).CornerRadius = UDim.new(0,6)
 local sp = Instance.new("UIPadding", summary)
 sp.PaddingLeft = UDim.new(0,8); sp.PaddingTop = UDim.new(0,5)
 
--- ===== kg threshold row =====
+-- kg threshold row
 local kgLabel = Instance.new("TextLabel", main)
 kgLabel.BackgroundTransparency = 1
 kgLabel.Size = UDim2.new(0,240,0,20); kgLabel.Position = UDim2.new(0,10,0,96)
@@ -250,7 +325,7 @@ kgHint.Size = UDim2.new(0,130,0,22); kgHint.Position = UDim2.new(0,325,0,96)
 kgHint.Font = Enum.Font.Gotham; kgHint.TextSize = 10
 kgHint.TextColor3 = Color3.fromRGB(140,140,160)
 kgHint.TextXAlignment = Enum.TextXAlignment.Left
-kgHint.Text = "auto-sells after sweep"
+kgHint.Text = "instant sell after collect"
 
 kgBox.FocusLost:Connect(function()
     local n = tonumber(kgBox.Text)
@@ -262,7 +337,7 @@ kgBox.FocusLost:Connect(function()
     end
 end)
 
--- ===== range filter row =====
+-- range filter row
 local rangeLabel = Instance.new("TextLabel", main)
 rangeLabel.BackgroundTransparency = 1
 rangeLabel.Size = UDim2.new(1,-20,0,16); rangeLabel.Position = UDim2.new(0,10,0,128)
@@ -299,7 +374,7 @@ for i, r in ipairs(RANGES) do
     end)
 end
 
--- ===== Fruit-type filter =====
+-- Fruit-type filter
 local fruitLabel = Instance.new("TextLabel", main)
 fruitLabel.BackgroundTransparency = 1
 fruitLabel.Size = UDim2.new(1,-20,0,16); fruitLabel.Position = UDim2.new(0,10,0,182)
@@ -391,7 +466,7 @@ fruitNoneBtn.MouseButton1Click:Connect(function()
     for _, b in pairs(fruitChips) do styleFruitChip(b, false) end
 end)
 
--- ===== actions =====
+-- actions
 local actionsBar = Instance.new("Frame", main)
 actionsBar.BackgroundTransparency = 1
 actionsBar.Size = UDim2.new(1,-20,0,30); actionsBar.Position = UDim2.new(0,10,0,258)
@@ -433,10 +508,11 @@ sPad.PaddingLeft = UDim.new(0,5); sPad.PaddingRight = UDim.new(0,5)
 sPad.PaddingTop  = UDim.new(0,5); sPad.PaddingBottom = UDim.new(0,5)
 
 local function makeRow(fruit, seedName, order)
-    local size = fruit:GetAttribute("SizeMulti") or 0
-    local mut  = fruit:GetAttribute("Mutation")
-    local tier = tierOf(size)
-    local val  = valueOf(seedName, size, mut)
+    local size   = fruit:GetAttribute("SizeMulti") or 0
+    local mut    = fruit:GetAttribute("Mutation")
+    local weight = kgOf(seedName, size)
+    local val    = valueOf(seedName, size, mut)
+    local resolved = BASE_KG[seedName] ~= nil
 
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1,0,0,32)
@@ -444,16 +520,19 @@ local function makeRow(fruit, seedName, order)
     row.LayoutOrder = order
     Instance.new("UICorner", row).CornerRadius = UDim.new(0,5)
 
-    local tierBadge = Instance.new("TextLabel", row)
-    tierBadge.Size = UDim2.new(0,32,0,22); tierBadge.Position = UDim2.new(0,6,0.5,-11)
-    tierBadge.BackgroundColor3 = tier.color; tierBadge.BorderSizePixel = 0
-    tierBadge.Font = Enum.Font.GothamBold; tierBadge.TextSize = 12
-    tierBadge.TextColor3 = Color3.fromRGB(20,20,20); tierBadge.Text = tier.name
-    Instance.new("UICorner", tierBadge).CornerRadius = UDim.new(0,4)
+    -- kg badge (replaces tier badge)
+    local kgBadge = Instance.new("TextLabel", row)
+    kgBadge.Size = UDim2.new(0, 62, 0, 22); kgBadge.Position = UDim2.new(0, 6, 0.5, -11)
+    kgBadge.BackgroundColor3 = colorForSize(size); kgBadge.BorderSizePixel = 0
+    kgBadge.Font = Enum.Font.GothamBold; kgBadge.TextSize = 11
+    kgBadge.TextColor3 = Color3.fromRGB(20,20,20)
+    -- show trailing ~ if we're guessing on the base kg
+    kgBadge.Text = string.format("%.2fkg%s", weight, resolved and "" or "~")
+    Instance.new("UICorner", kgBadge).CornerRadius = UDim.new(0,4)
 
     local nameLbl = Instance.new("TextLabel", row)
     nameLbl.BackgroundTransparency = 1
-    nameLbl.Size = UDim2.new(0,130,1,0); nameLbl.Position = UDim2.new(0,46,0,0)
+    nameLbl.Size = UDim2.new(0,130,1,0); nameLbl.Position = UDim2.new(0,76,0,0)
     nameLbl.Font = Enum.Font.GothamSemibold; nameLbl.TextSize = 12
     nameLbl.TextColor3 = Color3.fromRGB(235,235,250); nameLbl.Text = seedName
     nameLbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -490,7 +569,7 @@ local function makeRow(fruit, seedName, order)
     sizeLbl.Position = UDim2.new(1, -(badgeW + (hasMut and 72 or 10)), 0, 0)
     sizeLbl.Font = Enum.Font.GothamBold; sizeLbl.TextSize = 12
     sizeLbl.TextColor3 = Color3.fromRGB(255,220,120)
-    sizeLbl.Text = string.format("%.2fkg", kgOf(size))
+    sizeLbl.Text = string.format("x%.2f", size)
     sizeLbl.TextXAlignment = Enum.TextXAlignment.Right
 
     if hasMut then
@@ -530,14 +609,13 @@ local function scan()
                 fruitCounts[seed] = (fruitCounts[seed] or 0) + 1
                 local size = fruit:GetAttribute("SizeMulti") or 0
                 local mut  = fruit:GetAttribute("Mutation")
-                local tier = tierOf(size)
                 local val  = valueOf(seed, size, mut)
-                if kgOf(size) < kgThreshold then underThresh += 1 end
+                if kgOf(seed, size) < kgThreshold then underThresh += 1 end
                 if mut and mut ~= "" then
                     mutCount += 1
                     mutTypes[mut] = (mutTypes[mut] or 0) + 1
                 end
-                table.insert(rows, {fruit=fruit, plant=plant, seed=seed, size=size, mut=mut, tier=tier, val=val})
+                table.insert(rows, {fruit=fruit, plant=plant, seed=seed, size=size, mut=mut, val=val})
             end
         end
     end
@@ -551,8 +629,11 @@ local function scan()
 
     local mline = ""
     for m, c in pairs(mutTypes) do mline = mline..string.format("%s:%d  ", m, c) end
-    summary.Text = string.format("Plot: %s  |  Fruits: %d  |  <%.2fkg: %d  |  Mutated: %d%s",
-        plot.Name, total, kgThreshold, underThresh, mutCount,
+    local resolvedCount = 0
+    for _ in pairs(BASE_KG) do resolvedCount += 1 end
+    summary.Text = string.format(
+        "Plot: %s  |  Fruits: %d  |  <%.2fkg: %d  |  Mutated: %d  |  BaseKg: %d seeds%s",
+        plot.Name, total, kgThreshold, underThresh, mutCount, resolvedCount,
         mline ~= "" and "\n"..mline or "")
 end
 
@@ -621,13 +702,13 @@ local function collectInRanges()
     return count
 end
 
--- Auto loop = threshold cleanup mode. Collects any ripe fruit UNDER kgThreshold,
--- then fires SellAll to flush the inventory.
+-- Auto loop = threshold cleanup mode. Collects 2 fruits per tick in parallel
+-- and flags an instant sell after each pair.
 local function autoCollectStep()
     local plot = findPlot()
     if not plot or not plot:FindFirstChild("Plants") then return 0 end
-    local count = 0
     pcall(function() lp.ReplicationFocus = lp.Character end)
+    local batch = {}
     for _, plant in ipairs(plot.Plants:GetChildren()) do
         local seed = plant:GetAttribute("SeedName") or "?"
         if fruitAllowed(seed) then
@@ -637,14 +718,28 @@ local function autoCollectStep()
                     local size   = fruit:GetAttribute("SizeMulti") or 0
                     local age    = fruit:GetAttribute("Age") or 0
                     local maxAge = fruit:GetAttribute("MaxAge") or 0
-                    if age >= maxAge and maxAge > 0 and kgOf(size) < kgThreshold then
-                        if fireCollect(plant, fruit) then
-                            count += 1; task.wait(PER_FRUIT_WAIT)
-                        end
+                    if age >= maxAge and maxAge > 0 and kgOf(seed, size) < kgThreshold then
+                        table.insert(batch, {plant, fruit})
                     end
                 end
             end
         end
+    end
+
+    local count = 0
+    -- Fire 2 at a time via task.spawn, then flag a sell.
+    for i = 1, #batch, 2 do
+        local a = batch[i]
+        local b = batch[i+1]
+        task.spawn(function() if fireCollect(a[1], a[2]) then end end)
+        if b then
+            task.spawn(function() if fireCollect(b[1], b[2]) then end end)
+            count += 2
+        else
+            count += 1
+        end
+        pendingSell = true   -- fires SellAll within ~50ms
+        task.wait(PER_FRUIT_WAIT)
     end
     return count
 end
@@ -673,10 +768,6 @@ task.spawn(function()
         if autoCollectOn then
             local n = autoCollectStep()
             if n > 0 then
-                -- collected trash under the kg line — flush inventory
-                if os.clock() - lastSellAt >= SELL_COOLDOWN then
-                    sellAll()
-                end
                 task.wait(AUTO_LOOP_WAIT)
             else
                 task.wait(IDLE_LOOP_WAIT)
@@ -728,5 +819,9 @@ closeBtn.MouseButton1Click:Connect(function()
 end)
 
 scan()
-print("[FruitScanner v4.9] loaded — kg threshold cleanup + autosell")
-print(string.format("[FruitScanner v4.9] threshold %.2fkg (SizeMulti < %.3f)", kgThreshold, kgThreshold / KG_PER_UNIT))
+local resolved = 0
+for _ in pairs(BASE_KG) do resolved += 1 end
+print(string.format("[FruitScanner v5.0] loaded — resolved base kg for %d seeds", resolved))
+if resolved == 0 then
+    print("[FruitScanner v5.0] no base kg data found — falling back to "..FALLBACK_KG.." per unit for all seeds (rows will show ~)")
+end

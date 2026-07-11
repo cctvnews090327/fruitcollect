@@ -1,15 +1,16 @@
 -- ============================================================
--- GAG2 Fruit Scanner v4.8
--- Changes from v4.7:
---   * NEW: Multi-select fruit-type filter (auto-populated from plot)
---     Empty = collect all (same as before). Pick types = AND filter.
---     Quick "All / None" buttons.
---   * Formula confirmed against Dragon's Breath datapoints:
---       8.92kg->6.35k  9.16kg->6.81k  10.46kg->9.83k  11.04kg->11.09k
---     Fits cleanly with base * sizeMulti^2.65 where base ~= 4533.
---     (sizeMulti = weight / 7.5kg base weight)
---     If Dragon's Breath shows wrong $, check SVD["Dragon's Breath"];
---     SellValueData may not have it loaded. Formula itself is right.
+-- GAG2 Fruit Scanner v4.9
+-- Changes from v4.8:
+--   * REMOVED tier-list filter UI (T1..T9 buttons + All/None/High/Low).
+--     Tier badges still render on each row for at-a-glance color.
+--   * NEW: kg threshold input. Ripe fruits with weight < threshold get
+--     collected by the auto loop (cleanup mode for low-value trash).
+--     weight_kg = SizeMulti * KG_PER_UNIT   (KG_PER_UNIT = 7.5)
+--   * NEW: When the auto loop collects via the kg threshold, it fires
+--     Networking.NPCS.SellAll after the sweep so inventory doesn't clog.
+--     Range collection and Mutated collection do NOT auto-sell — those
+--     are the "keep the good stuff, sell manually" paths.
+--   * Fruit-type filter still applies to every collect path.
 -- ============================================================
 if game:GetService("CoreGui"):FindFirstChild("GAG_FruitScanner") then
     game:GetService("CoreGui").GAG_FruitScanner:Destroy()
@@ -29,6 +30,9 @@ pcall(function() SVD = require(RS.SharedModules.SellValueData) end)
 local AUTO_LOOP_WAIT    = 0.4
 local PER_FRUIT_WAIT    = 0.0001
 local IDLE_LOOP_WAIT    = 0.4
+local KG_PER_UNIT       = 7.5     -- SizeMulti 1.0 == 7.5 kg
+local DEFAULT_KG_THRESH = 5.0     -- collect anything under 5kg by default
+local SELL_COOLDOWN     = 0.05     -- min seconds between SellAll calls
 
 -- ===== REAL formula from FruitValueCalc =====
 local SIZE_EXPONENT_DEFAULT = 2.65
@@ -76,17 +80,19 @@ local function valueOf(seedName, size, mut)
     return v
 end
 
--- ---------- tiers ----------
+local function kgOf(size) return (size or 0) * KG_PER_UNIT end
+
+-- ---------- tiers (display-only now) ----------
 local TIERS = {
     {min=15.0, max=math.huge, name="T9", color=Color3.fromRGB(255,80,255)},
     {min=6.0, max=15.0,      name="T8", color=Color3.fromRGB(255,40,90)},
-    {min=5.0, max=6.0,      name="T7", color=Color3.fromRGB(255,140,0)},
-    {min=4.0, max=5.0,      name="T6", color=Color3.fromRGB(255,210,0)},
-    {min=3.0, max=4.0,      name="T5", color=Color3.fromRGB(120,220,90)},
-    {min=2.0, max=3.0,      name="T4", color=Color3.fromRGB(80,200,200)},
-    {min=1.5, max=2.0,      name="T3", color=Color3.fromRGB(90,150,255)},
-    {min=1.0, max=1.5,      name="T2", color=Color3.fromRGB(170,170,170)},
-    {min=0.0, max=1.0,      name="T1", color=Color3.fromRGB(120,120,120)},
+    {min=5.0, max=6.0,       name="T7", color=Color3.fromRGB(255,140,0)},
+    {min=4.0, max=5.0,       name="T6", color=Color3.fromRGB(255,210,0)},
+    {min=3.0, max=4.0,       name="T5", color=Color3.fromRGB(120,220,90)},
+    {min=2.0, max=3.0,       name="T4", color=Color3.fromRGB(80,200,200)},
+    {min=1.5, max=2.0,       name="T3", color=Color3.fromRGB(90,150,255)},
+    {min=1.0, max=1.5,       name="T2", color=Color3.fromRGB(170,170,170)},
+    {min=0.0, max=1.0,       name="T1", color=Color3.fromRGB(120,120,120)},
 }
 local function tierOf(size)
     for _, t in ipairs(TIERS) do
@@ -149,18 +155,24 @@ local function findPlot()
     end
 end
 
-local selectedTiers  = {}
 local selectedRanges = {}
-local selectedFruits = {}      -- NEW: seed-name -> true
+local selectedFruits = {}
 local autoCollectOn  = false
+local kgThreshold    = DEFAULT_KG_THRESH
+local lastSellAt     = 0
 
 local function anyFruitSelected()
     for _ in pairs(selectedFruits) do return true end
     return false
 end
 local function fruitAllowed(seedName)
-    if not anyFruitSelected() then return true end  -- empty = all
+    if not anyFruitSelected() then return true end
     return selectedFruits[seedName] == true
+end
+
+local function sellAll()
+    pcall(function() Networking.NPCS.SellAll:Fire() end)
+    lastSellAt = os.clock()
 end
 
 -- ---------- UI ----------
@@ -168,7 +180,7 @@ local gui = Instance.new("ScreenGui")
 gui.Name = "GAG_FruitScanner"; gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = CoreGui
 
-local MAIN_H = 690  -- bumped for fruit-type row
+local MAIN_H = 640
 local main = Instance.new("Frame", gui)
 main.Size = UDim2.new(0, 460, 0, MAIN_H)
 main.Position = UDim2.new(0, 40, 0.5, -MAIN_H/2)
@@ -185,7 +197,7 @@ Instance.new("UICorner", header).CornerRadius = UDim.new(0,10)
 local title = Instance.new("TextLabel", header)
 title.BackgroundTransparency = 1
 title.Size = UDim2.new(1,-120,1,0); title.Position = UDim2.new(0,12,0,0)
-title.Font = Enum.Font.GothamBold; title.Text = "🍒 Fruit Scanner v4.8 — fruit filter"
+title.Font = Enum.Font.GothamBold; title.Text = "🍒 Fruit Scanner v4.9 — kg threshold + autosell"
 title.TextColor3 = Color3.fromRGB(240,240,255); title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 
@@ -214,97 +226,54 @@ Instance.new("UICorner", summary).CornerRadius = UDim.new(0,6)
 local sp = Instance.new("UIPadding", summary)
 sp.PaddingLeft = UDim.new(0,8); sp.PaddingTop = UDim.new(0,5)
 
-local filterLabel = Instance.new("TextLabel", main)
-filterLabel.BackgroundTransparency = 1
-filterLabel.Size = UDim2.new(1,-20,0,16); filterLabel.Position = UDim2.new(0,10,0,96)
-filterLabel.Font = Enum.Font.GothamSemibold; filterLabel.TextSize = 11
-filterLabel.TextColor3 = Color3.fromRGB(180,180,200)
-filterLabel.TextXAlignment = Enum.TextXAlignment.Left
-filterLabel.Text = "Auto-collect tiers (used when no value range is picked):"
+-- ===== kg threshold row =====
+local kgLabel = Instance.new("TextLabel", main)
+kgLabel.BackgroundTransparency = 1
+kgLabel.Size = UDim2.new(0,240,0,20); kgLabel.Position = UDim2.new(0,10,0,96)
+kgLabel.Font = Enum.Font.GothamSemibold; kgLabel.TextSize = 11
+kgLabel.TextColor3 = Color3.fromRGB(180,180,200)
+kgLabel.TextXAlignment = Enum.TextXAlignment.Left
+kgLabel.Text = "⚖️ Auto-collect fruits UNDER (kg):"
 
-local filterBar = Instance.new("Frame", main)
-filterBar.BackgroundTransparency = 1
-filterBar.Size = UDim2.new(1,-20,0,28); filterBar.Position = UDim2.new(0,10,0,114)
-local fLayout = Instance.new("UIListLayout", filterBar)
-fLayout.FillDirection = Enum.FillDirection.Horizontal
-fLayout.Padding = UDim.new(0,4); fLayout.SortOrder = Enum.SortOrder.LayoutOrder
+local kgBox = Instance.new("TextBox", main)
+kgBox.Size = UDim2.new(0,70,0,22); kgBox.Position = UDim2.new(0,250,0,96)
+kgBox.BackgroundColor3 = Color3.fromRGB(40,40,55); kgBox.BorderSizePixel = 0
+kgBox.Font = Enum.Font.GothamBold; kgBox.TextSize = 13
+kgBox.TextColor3 = Color3.fromRGB(255,220,120)
+kgBox.Text = string.format("%.2f", kgThreshold)
+kgBox.ClearTextOnFocus = false
+Instance.new("UICorner", kgBox).CornerRadius = UDim.new(0,5)
 
-local function buildTierButtons()
-    local ordered = {}
-    for i = #TIERS, 1, -1 do table.insert(ordered, TIERS[i]) end
-    for i, t in ipairs(ordered) do
-        local b = Instance.new("TextButton", filterBar)
-        b.Size = UDim2.new(0,40,1,0); b.LayoutOrder = i
-        b.BackgroundColor3 = Color3.fromRGB(45,45,55); b.BorderSizePixel = 0
-        b.Font = Enum.Font.GothamBold; b.TextSize = 12
-        b.TextColor3 = Color3.fromRGB(220,220,235); b.Text = t.name
-        Instance.new("UICorner", b).CornerRadius = UDim.new(0,5)
-        local strokeB = Instance.new("UIStroke", b)
-        strokeB.Color = t.color; strokeB.Thickness = 1
-        b.MouseButton1Click:Connect(function()
-            selectedTiers[t.name] = not selectedTiers[t.name]
-            if selectedTiers[t.name] then
-                b.BackgroundColor3 = t.color; b.TextColor3 = Color3.fromRGB(20,20,20)
-                strokeB.Thickness = 2
-            else
-                b.BackgroundColor3 = Color3.fromRGB(45,45,55); b.TextColor3 = Color3.fromRGB(220,220,235)
-                strokeB.Thickness = 1
-            end
-        end)
+local kgHint = Instance.new("TextLabel", main)
+kgHint.BackgroundTransparency = 1
+kgHint.Size = UDim2.new(0,130,0,22); kgHint.Position = UDim2.new(0,325,0,96)
+kgHint.Font = Enum.Font.Gotham; kgHint.TextSize = 10
+kgHint.TextColor3 = Color3.fromRGB(140,140,160)
+kgHint.TextXAlignment = Enum.TextXAlignment.Left
+kgHint.Text = "auto-sells after sweep"
+
+kgBox.FocusLost:Connect(function()
+    local n = tonumber(kgBox.Text)
+    if n and n >= 0 then
+        kgThreshold = n
+        kgBox.Text = string.format("%.2f", n)
+    else
+        kgBox.Text = string.format("%.2f", kgThreshold)
     end
-end
-buildTierButtons()
+end)
 
-local qsBar = Instance.new("Frame", main)
-qsBar.BackgroundTransparency = 1
-qsBar.Size = UDim2.new(1,-20,0,22); qsBar.Position = UDim2.new(0,10,0,148)
-local qsLayout = Instance.new("UIListLayout", qsBar)
-qsLayout.FillDirection = Enum.FillDirection.Horizontal; qsLayout.Padding = UDim.new(0,4)
-
-local function refreshTierButtons()
-    for _, btn in ipairs(filterBar:GetChildren()) do
-        if btn:IsA("TextButton") then
-            local tierName = btn.Text
-            local t
-            for _, tt in ipairs(TIERS) do if tt.name == tierName then t = tt; break end end
-            local strokeB = btn:FindFirstChildOfClass("UIStroke")
-            if selectedTiers[tierName] then
-                btn.BackgroundColor3 = t.color; btn.TextColor3 = Color3.fromRGB(20,20,20)
-                if strokeB then strokeB.Thickness = 2 end
-            else
-                btn.BackgroundColor3 = Color3.fromRGB(45,45,55); btn.TextColor3 = Color3.fromRGB(220,220,235)
-                if strokeB then strokeB.Thickness = 1 end
-            end
-        end
-    end
-end
-
-local function mkQS(text, fn)
-    local b = Instance.new("TextButton", qsBar)
-    b.Size = UDim2.new(0,60,1,0)
-    b.BackgroundColor3 = Color3.fromRGB(40,40,55); b.BorderSizePixel = 0
-    b.Font = Enum.Font.Gotham; b.TextSize = 11
-    b.TextColor3 = Color3.fromRGB(200,200,220); b.Text = text
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0,4)
-    b.MouseButton1Click:Connect(function() fn(); refreshTierButtons() end)
-    return b
-end
-mkQS("All", function() for _,t in ipairs(TIERS) do selectedTiers[t.name]=true end end)
-mkQS("None", function() selectedTiers = {} end)
-mkQS("High", function() selectedTiers = {}; for _, n in ipairs({"T7","T8","T9"}) do selectedTiers[n]=true end end)
-mkQS("Low",  function() selectedTiers = {}; for _, n in ipairs({"T1","T2","T3"}) do selectedTiers[n]=true end end)
-
+-- ===== range filter row =====
 local rangeLabel = Instance.new("TextLabel", main)
 rangeLabel.BackgroundTransparency = 1
-rangeLabel.Size = UDim2.new(1,-20,0,16); rangeLabel.Position = UDim2.new(0,10,0,178)
+rangeLabel.Size = UDim2.new(1,-20,0,16); rangeLabel.Position = UDim2.new(0,10,0,128)
 rangeLabel.Font = Enum.Font.GothamSemibold; rangeLabel.TextSize = 11
 rangeLabel.TextColor3 = Color3.fromRGB(180,180,200)
 rangeLabel.TextXAlignment = Enum.TextXAlignment.Left
-rangeLabel.Text = "💰 Value ranges (multi-select — overrides tiers when picked):"
+rangeLabel.Text = "💰 Value ranges (multi-select — for the 'Collect Range' button, no auto-sell):"
 
 local rangeBar = Instance.new("Frame", main)
 rangeBar.BackgroundTransparency = 1
-rangeBar.Size = UDim2.new(1,-20,0,28); rangeBar.Position = UDim2.new(0,10,0,196)
+rangeBar.Size = UDim2.new(1,-20,0,28); rangeBar.Position = UDim2.new(0,10,0,146)
 local rLayout = Instance.new("UIListLayout", rangeBar)
 rLayout.FillDirection = Enum.FillDirection.Horizontal
 rLayout.Padding = UDim.new(0,4); rLayout.SortOrder = Enum.SortOrder.LayoutOrder
@@ -330,33 +299,31 @@ for i, r in ipairs(RANGES) do
     end)
 end
 
--- ===== NEW: Fruit-type filter =====
+-- ===== Fruit-type filter =====
 local fruitLabel = Instance.new("TextLabel", main)
 fruitLabel.BackgroundTransparency = 1
-fruitLabel.Size = UDim2.new(1,-20,0,16); fruitLabel.Position = UDim2.new(0,10,0,232)
+fruitLabel.Size = UDim2.new(1,-20,0,16); fruitLabel.Position = UDim2.new(0,10,0,182)
 fruitLabel.Font = Enum.Font.GothamSemibold; fruitLabel.TextSize = 11
 fruitLabel.TextColor3 = Color3.fromRGB(180,180,200)
 fruitLabel.TextXAlignment = Enum.TextXAlignment.Left
 fruitLabel.Text = "🌱 Fruit types (empty = all). Click to toggle:"
 
--- Quick buttons sit to the right of the label
 local fruitAllBtn = Instance.new("TextButton", main)
-fruitAllBtn.Size = UDim2.new(0,40,0,16); fruitAllBtn.Position = UDim2.new(1,-100,0,232)
+fruitAllBtn.Size = UDim2.new(0,40,0,16); fruitAllBtn.Position = UDim2.new(1,-100,0,182)
 fruitAllBtn.BackgroundColor3 = Color3.fromRGB(40,40,55); fruitAllBtn.BorderSizePixel = 0
 fruitAllBtn.Font = Enum.Font.Gotham; fruitAllBtn.TextSize = 10
 fruitAllBtn.TextColor3 = Color3.fromRGB(200,200,220); fruitAllBtn.Text = "All"
 Instance.new("UICorner", fruitAllBtn).CornerRadius = UDim.new(0,4)
 
 local fruitNoneBtn = Instance.new("TextButton", main)
-fruitNoneBtn.Size = UDim2.new(0,46,0,16); fruitNoneBtn.Position = UDim2.new(1,-56,0,232)
+fruitNoneBtn.Size = UDim2.new(0,46,0,16); fruitNoneBtn.Position = UDim2.new(1,-56,0,182)
 fruitNoneBtn.BackgroundColor3 = Color3.fromRGB(40,40,55); fruitNoneBtn.BorderSizePixel = 0
 fruitNoneBtn.Font = Enum.Font.Gotham; fruitNoneBtn.TextSize = 10
 fruitNoneBtn.TextColor3 = Color3.fromRGB(200,200,220); fruitNoneBtn.Text = "None"
 Instance.new("UICorner", fruitNoneBtn).CornerRadius = UDim.new(0,4)
 
--- Scrolling container for fruit chips (horizontal scroll, 2 rows via wrap)
 local fruitBar = Instance.new("ScrollingFrame", main)
-fruitBar.Size = UDim2.new(1,-20,0,52); fruitBar.Position = UDim2.new(0,10,0,250)
+fruitBar.Size = UDim2.new(1,-20,0,52); fruitBar.Position = UDim2.new(0,10,0,200)
 fruitBar.BackgroundColor3 = Color3.fromRGB(18,18,24); fruitBar.BorderSizePixel = 0
 fruitBar.ScrollBarThickness = 4; fruitBar.ScrollBarImageColor3 = Color3.fromRGB(80,80,110)
 fruitBar.CanvasSize = UDim2.new(0,0,0,0); fruitBar.AutomaticCanvasSize = Enum.AutomaticSize.Y
@@ -370,7 +337,7 @@ local fbPad = Instance.new("UIPadding", fruitBar)
 fbPad.PaddingLeft = UDim.new(0,5); fbPad.PaddingTop = UDim.new(0,5)
 fbPad.PaddingRight = UDim.new(0,5); fbPad.PaddingBottom = UDim.new(0,5)
 
-local fruitChips = {}  -- seedName -> button
+local fruitChips = {}
 
 local function styleFruitChip(btn, on)
     if on then
@@ -392,9 +359,9 @@ local function makeFruitChip(seedName, count)
     Instance.new("UICorner", b).CornerRadius = UDim.new(0,4)
     styleFruitChip(b, selectedFruits[seedName] == true)
     b.MouseButton1Click:Connect(function()
-        selectedFruits[seedName] = not selectedFruits[seedName] or nil
         if selectedFruits[seedName] then
-            -- explicit true (since `not nil` is true)
+            selectedFruits[seedName] = nil
+        else
             selectedFruits[seedName] = true
         end
         styleFruitChip(b, selectedFruits[seedName] == true)
@@ -405,7 +372,6 @@ end
 local function rebuildFruitChips(counts)
     for _, c in pairs(fruitChips) do c:Destroy() end
     fruitChips = {}
-    -- sort by name
     local names = {}
     for n in pairs(counts) do table.insert(names, n) end
     table.sort(names)
@@ -424,11 +390,11 @@ fruitNoneBtn.MouseButton1Click:Connect(function()
     selectedFruits = {}
     for _, b in pairs(fruitChips) do styleFruitChip(b, false) end
 end)
--- ===== END fruit-type filter =====
 
+-- ===== actions =====
 local actionsBar = Instance.new("Frame", main)
 actionsBar.BackgroundTransparency = 1
-actionsBar.Size = UDim2.new(1,-20,0,30); actionsBar.Position = UDim2.new(0,10,0,308)
+actionsBar.Size = UDim2.new(1,-20,0,30); actionsBar.Position = UDim2.new(0,10,0,258)
 
 local autoCollectBtn = Instance.new("TextButton", actionsBar)
 autoCollectBtn.Size = UDim2.new(1/3,-3,1,0); autoCollectBtn.Position = UDim2.new(0,0,0,0)
@@ -455,7 +421,7 @@ collectMutBtn.Text = "✨ Mutated"
 Instance.new("UICorner", collectMutBtn).CornerRadius = UDim.new(0,6)
 
 local scroll = Instance.new("ScrollingFrame", main)
-scroll.Size = UDim2.new(1,-20,1,-352); scroll.Position = UDim2.new(0,10,0,346)
+scroll.Size = UDim2.new(1,-20,1,-302); scroll.Position = UDim2.new(0,10,0,296)
 scroll.BackgroundColor3 = Color3.fromRGB(18,18,24); scroll.BorderSizePixel = 0
 scroll.ScrollBarThickness = 5; scroll.ScrollBarImageColor3 = Color3.fromRGB(80,80,110)
 scroll.CanvasSize = UDim2.new(0,0,0,0); scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
@@ -520,11 +486,11 @@ local function makeRow(fruit, seedName, order)
 
     local sizeLbl = Instance.new("TextLabel", row)
     sizeLbl.BackgroundTransparency = 1
-    sizeLbl.Size = UDim2.new(0,60,1,0)
+    sizeLbl.Size = UDim2.new(0,72,1,0)
     sizeLbl.Position = UDim2.new(1, -(badgeW + (hasMut and 72 or 10)), 0, 0)
     sizeLbl.Font = Enum.Font.GothamBold; sizeLbl.TextSize = 12
     sizeLbl.TextColor3 = Color3.fromRGB(255,220,120)
-    sizeLbl.Text = string.format("x%.2f", size)
+    sizeLbl.Text = string.format("%.2fkg", kgOf(size))
     sizeLbl.TextXAlignment = Enum.TextXAlignment.Right
 
     if hasMut then
@@ -552,8 +518,9 @@ local function scan()
     local plants = plot:FindFirstChild("Plants")
     if not plants then summary.Text = "❌ No Plants folder."; return end
 
-    local rows, tierCounts, mutCount, mutTypes, total = {}, {}, 0, {}, 0
-    local fruitCounts = {}  -- NEW: per-seed count for chip labels
+    local rows, mutCount, mutTypes, total = {}, 0, {}, 0
+    local underThresh = 0
+    local fruitCounts = {}
     for _, plant in ipairs(plants:GetChildren()) do
         local seed = plant:GetAttribute("SeedName") or "?"
         local fruits = plant:FindFirstChild("Fruits")
@@ -565,7 +532,7 @@ local function scan()
                 local mut  = fruit:GetAttribute("Mutation")
                 local tier = tierOf(size)
                 local val  = valueOf(seed, size, mut)
-                tierCounts[tier.name] = (tierCounts[tier.name] or 0) + 1
+                if kgOf(size) < kgThreshold then underThresh += 1 end
                 if mut and mut ~= "" then
                     mutCount += 1
                     mutTypes[mut] = (mutTypes[mut] or 0) + 1
@@ -580,18 +547,12 @@ local function scan()
     end)
     for i, r in ipairs(rows) do makeRow(r.fruit, r.seed, i).Parent = scroll end
 
-    rebuildFruitChips(fruitCounts)  -- NEW
+    rebuildFruitChips(fruitCounts)
 
-    local tline = ""
-    for _, t in ipairs(TIERS) do
-        local c = tierCounts[t.name] or 0
-        if c > 0 then tline = tline..string.format("%s:%d  ", t.name, c) end
-    end
     local mline = ""
     for m, c in pairs(mutTypes) do mline = mline..string.format("%s:%d  ", m, c) end
-    summary.Text = string.format("Plot: %s  |  Fruits: %d  |  Mutated: %d\n%s%s",
-        plot.Name, total, mutCount,
-        tline ~= "" and tline or "(no fruits) ",
+    summary.Text = string.format("Plot: %s  |  Fruits: %d  |  <%.2fkg: %d  |  Mutated: %d%s",
+        plot.Name, total, kgThreshold, underThresh, mutCount,
         mline ~= "" and "\n"..mline or "")
 end
 
@@ -612,7 +573,7 @@ local function collectAllMutated()
     pcall(function() lp.ReplicationFocus = lp.Character end)
     for _, plant in ipairs(plot.Plants:GetChildren()) do
         local seed = plant:GetAttribute("SeedName") or "?"
-        if fruitAllowed(seed) then  -- NEW: respect fruit filter
+        if fruitAllowed(seed) then
             local fruits = plant:FindFirstChild("Fruits")
             if fruits then
                 for _, fruit in ipairs(fruits:GetChildren()) do
@@ -637,7 +598,7 @@ local function collectInRanges()
     pcall(function() lp.ReplicationFocus = lp.Character end)
     for _, plant in ipairs(plot.Plants:GetChildren()) do
         local seed = plant:GetAttribute("SeedName") or "?"
-        if fruitAllowed(seed) then  -- NEW
+        if fruitAllowed(seed) then
             local fruits = plant:FindFirstChild("Fruits")
             if fruits then
                 for _, fruit in ipairs(fruits:GetChildren()) do
@@ -660,32 +621,24 @@ local function collectInRanges()
     return count
 end
 
+-- Auto loop = threshold cleanup mode. Collects any ripe fruit UNDER kgThreshold,
+-- then fires SellAll to flush the inventory.
 local function autoCollectStep()
     local plot = findPlot()
     if not plot or not plot:FindFirstChild("Plants") then return 0 end
-    local useRanges = anyRangeSelected(selectedRanges)
     local count = 0
     pcall(function() lp.ReplicationFocus = lp.Character end)
     for _, plant in ipairs(plot.Plants:GetChildren()) do
         local seed = plant:GetAttribute("SeedName") or "?"
-        if fruitAllowed(seed) then  -- NEW
+        if fruitAllowed(seed) then
             local fruits = plant:FindFirstChild("Fruits")
             if fruits then
                 for _, fruit in ipairs(fruits:GetChildren()) do
                     local size   = fruit:GetAttribute("SizeMulti") or 0
-                    local mut    = fruit:GetAttribute("Mutation")
                     local age    = fruit:GetAttribute("Age") or 0
                     local maxAge = fruit:GetAttribute("MaxAge") or 0
-                    if age >= maxAge and maxAge > 0 then
-                        local match = false
-                        if useRanges then
-                            local val = valueOf(seed, size, mut)
-                            if inAnySelectedRange(val, selectedRanges) then match = true end
-                        else
-                            local tier = tierOf(size)
-                            if selectedTiers[tier.name] then match = true end
-                        end
-                        if match and fireCollect(plant, fruit) then
+                    if age >= maxAge and maxAge > 0 and kgOf(size) < kgThreshold then
+                        if fireCollect(plant, fruit) then
                             count += 1; task.wait(PER_FRUIT_WAIT)
                         end
                     end
@@ -720,6 +673,10 @@ task.spawn(function()
         if autoCollectOn then
             local n = autoCollectStep()
             if n > 0 then
+                -- collected trash under the kg line — flush inventory
+                if os.clock() - lastSellAt >= SELL_COOLDOWN then
+                    sellAll()
+                end
                 task.wait(AUTO_LOOP_WAIT)
             else
                 task.wait(IDLE_LOOP_WAIT)
@@ -771,5 +728,5 @@ closeBtn.MouseButton1Click:Connect(function()
 end)
 
 scan()
-print("[FruitScanner v4.8] loaded — fruit-type multi-select added")
-print("[FruitScanner v4.8] DB confirms: value = base * sizeMulti^2.65 (Dragon's Breath base ~4533)")
+print("[FruitScanner v4.9] loaded — kg threshold cleanup + autosell")
+print(string.format("[FruitScanner v4.9] threshold %.2fkg (SizeMulti < %.3f)", kgThreshold, kgThreshold / KG_PER_UNIT))

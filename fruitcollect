@@ -78,8 +78,8 @@ end
 
 -- ---------- tiers ----------
 local TIERS = {
-    {min=8.0, max=math.huge, name="T9", color=Color3.fromRGB(255,80,255)},
-    {min=6.0, max=8.0,      name="T8", color=Color3.fromRGB(255,40,90)},
+    {min=20.0, max=math.huge, name="T9", color=Color3.fromRGB(255,80,255)},
+    {min=15.0, max=20.0,      name="T8", color=Color3.fromRGB(255,40,90)},
     {min=5.0, max=6.0,      name="T7", color=Color3.fromRGB(255,140,0)},
     {min=4.0, max=5.0,      name="T6", color=Color3.fromRGB(255,210,0)},
     {min=3.0, max=4.0,      name="T5", color=Color3.fromRGB(120,220,90)},

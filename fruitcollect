@@ -26,7 +26,7 @@ pcall(function() SVD = require(RS.SharedModules.SellValueData) end)
 
 -- ===== TUNING =====
 local AUTO_LOOP_WAIT      = 0.3
-local PER_FRUIT_WAIT      = 0.0001
+local PER_FRUIT_WAIT      = 0.05
 local IDLE_LOOP_WAIT      = 0.2
 local FALLBACK_KG         = 1.0
 local DEFAULT_SIZE_THRESH = 2.0     -- collect fruits with SizeMulti under this
